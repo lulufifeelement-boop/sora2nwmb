@@ -85,7 +85,6 @@ def _download_file_with_progress(url: str, progress: dict, cancel_event: threadi
     progress["path"] = None
 
     try:
-        # важное: timeout=(connect, read). read ставим большим.
         with SESSION.get(url, stream=True, timeout=(20, 300)) as r:
             r.raise_for_status()
             cl = r.headers.get("content-length")
@@ -120,9 +119,6 @@ def _download_file_with_progress(url: str, progress: dict, cancel_event: threadi
         raise
 
 async def _progress_updater(msg, label: str, progress: dict):
-    """
-    Обновляем прогресс в сообщении, но без “убийства” загрузки по таймеру.
-    """
     last_text = ""
     while not progress.get("done"):
         downloaded = int(progress.get("downloaded") or 0)
@@ -144,11 +140,6 @@ async def _progress_updater(msg, label: str, progress: dict):
         await asyncio.sleep(1.2)
 
 async def _download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, label: str, filename: str):
-    """
-    Скачиваем в отдельном потоке, шлём как video.
-    1 автоповтор при таймауте.
-    Ошибку показываем аккуратно, без возврата исходной ссылки.
-    """
     progress_msg = await update.message.reply_text(f"⏳ Скачиваю «{label}»…")
     progress = {}
     cancel_event = threading.Event()
@@ -156,19 +147,15 @@ async def _download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     path = None
     try:
-        # 1-я попытка
         try:
             path = await asyncio.to_thread(_download_file_with_progress, url, progress, cancel_event)
         except Exception as e1:
-            # 2-я попытка только если похоже на таймаут
             if "timed out" in str(e1).lower() or "timeout" in str(e1).lower():
-                # сообщаем мягко
                 try:
                     await progress_msg.edit_text("⏳ Сеть притормозила… пробую ещё раз.")
                 except Exception:
                     pass
 
-                # сброс прогресса
                 progress["done"] = False
                 progress["error"] = None
                 progress["downloaded"] = 0
@@ -178,17 +165,16 @@ async def _download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
             else:
                 raise
 
-        # загрузка завершилась
         try:
             await progress_msg.edit_text("📤 Загружено. Отправляю в Telegram…")
         except Exception:
             pass
 
+        # Надёжнее отправлять как документ с именем файла
         with open(path, "rb") as f:
-            await update.message.reply_video(video=f, caption=f"Готово ✅ «{label}» отправлено.")
+            await update.message.reply_document(document=f, filename=filename, caption=f"Готово ✅ «{label}» отправлено.")
 
     except Exception:
-        # Не возвращаем ссылку и не показываем “страшную” тех.ошибку
         await update.message.reply_text(
             "Не получилось скачать видео (сеть/сервер временно тормозит).\n"
             "Попробуй нажать кнопку ещё раз через 10–20 секунд."
@@ -219,7 +205,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     user_id = update.effective_user.id
 
-    # Кнопки меню (панель)
     if text == BTN_HELP:
         await update.message.reply_text(help_text(), reply_markup=panel_keyboard())
         return
@@ -245,13 +230,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename = "sora_original.mp4"
 
         if not url:
-            await update.message.reply_text("Для этого варианта ссылка не найдена. Пришли Sora-ссылку заново.")
+            await update.message.reply_text("Для этого варианта ссылка не найдена. Пришли Sora-ссылку заново.",
+                                            reply_markup=panel_keyboard())
             return
 
         await _download_and_send(update, context, url, label, filename)
         return
 
-    # Если это ссылка Sora — обрабатываем
     if SORA_RE.match(text):
         await update.message.reply_text("Принял ✅ Получаю ссылки…", reply_markup=panel_keyboard())
         try:
@@ -260,25 +245,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             item = cache_get(user_id)
             if not item or (not item.get("hq") and not item.get("alt")):
-                await update.message.reply_text("Не нашёл ссылок в ответе API. Попробуй другую ссылку.")
+                await update.message.reply_text("Не нашёл ссылок в ответе API. Попробуй другую ссылку.",
+                                                reply_markup=panel_keyboard())
                 return
 
-            await update.message.reply_text("Готово ✅ Теперь нажми кнопку внизу: «Без вотермарки» или «Оригинал».",
-                                           reply_markup=panel_keyboard())
+            await update.message.reply_text(
+                "Готово ✅ Теперь нажми кнопку внизу: «Без вотермарки» или «Оригинал».",
+                reply_markup=panel_keyboard()
+            )
 
-            # Удаляем сообщение пользователя со ссылкой (если есть права)
             try:
                 await update.message.delete()
             except Exception:
                 pass
 
         except Exception:
-            await update.message.reply_text("Не смог получить видео по этой ссылке. Попробуй ещё раз позже.")
+            await update.message.reply_text("Не смог получить видео по этой ссылке. Попробуй ещё раз позже.",
+                                            reply_markup=panel_keyboard())
         return
 
-    # Любой другой текст
-    await update.message.reply_text("Пришли ссылку Sora (https://sora.chatgpt.com/p/s_...) или нажми кнопку внизу.",
-                                    reply_markup=panel_keyboard())
+    await update.message.reply_text(
+        "Пришли ссылку Sora (https://sora.chatgpt.com/p/s_...) или нажми кнопку внизу.",
+        reply_markup=panel_keyboard()
+    )
 
 def main():
     token = os.getenv("BOT_TOKEN")
@@ -288,7 +277,7 @@ def main():
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.run_polling()
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
