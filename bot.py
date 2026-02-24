@@ -5,6 +5,9 @@ import asyncio
 import tempfile
 import threading
 import requests
+import http.server
+import socketserver
+from typing import Optional
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -15,8 +18,13 @@ from telegram.ext import (
     CommandHandler,
 )
 
+# -----------------------------
+# CONFIG
+# -----------------------------
 API_URL = "https://sorasave.questloops.com/api/video-info"
 SORA_RE = re.compile(r"^https://sora\.chatgpt\.com/p/s_[\w-]+", re.IGNORECASE)
+
+TTL_SEC = 10 * 60
 
 # Кнопки (панель над вводом)
 BTN_NO_WM = "⬇️ Без вотермарки"
@@ -24,7 +32,9 @@ BTN_ORIG  = "⬇️ Оригинал"
 BTN_NEW   = "🔁 Новая ссылка"
 BTN_HELP  = "ℹ️ Помощь"
 
-
+# -----------------------------
+# UI
+# -----------------------------
 def panel_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -34,34 +44,34 @@ def panel_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
-
 def help_text() -> str:
     return (
         "Как пользоваться:\n"
         "1) Пришли ссылку Sora вида: https://sora.chatgpt.com/p/s_...\n"
         "2) Нажми внизу кнопку: «Без вотермарки» или «Оригинал»\n"
         "3) Я скачаю и пришлю файлом\n\n"
-        "Если долго — это из-за CDN, иногда надо чуть подождать."
+        "Если долго — это из-за CDN/сети. Иногда нужно подождать."
     )
 
-
+# -----------------------------
+# REQUESTS SESSION
+# -----------------------------
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0",
     "Referer": "https://sorasave.questloops.com/",
     "Origin": "https://sorasave.questloops.com",
+    "Accept": "*/*",
+    "Connection": "keep-alive",
 })
 
-# user_id -> {"hq": url, "alt": url, "ts": epoch}
+# user_id -> {"hq": url, "alt": url, "ts": epoch, "sora": original_sora_url}
 CACHE: dict[int, dict] = {}
-TTL_SEC = 10 * 60
 
+def cache_put(user_id: int, sora_url: str, hq: Optional[str], alt: Optional[str]):
+    CACHE[user_id] = {"sora": sora_url, "hq": hq, "alt": alt, "ts": time.time()}
 
-def cache_put(user_id: int, hq: str | None, alt: str | None):
-    CACHE[user_id] = {"hq": hq, "alt": alt, "ts": time.time()}
-
-
-def cache_get(user_id: int) -> dict | None:
+def cache_get(user_id: int) -> Optional[dict]:
     item = CACHE.get(user_id)
     if not item:
         return None
@@ -70,74 +80,146 @@ def cache_get(user_id: int) -> dict | None:
         return None
     return item
 
+# -----------------------------
+# HEALTH SERVER (Render Web Service requires an open port)
+# -----------------------------
+class _HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health", "/healthz"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.end_headers()
 
+    def log_message(self, format, *args):
+        # отключаем шум в логах
+        return
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    with socketserver.TCPServer(("", port), _HealthHandler) as httpd:
+        print(f"[health] listening on :{port}")
+        httpd.serve_forever()
+
+# -----------------------------
+# API
+# -----------------------------
 def fetch_video_info(sora_url: str) -> dict:
     r = SESSION.post(API_URL, json={"url": sora_url}, timeout=40)
     r.raise_for_status()
     return r.json()
 
-
 def _fmt_mb(n_bytes: int) -> str:
     return f"{n_bytes / (1024 * 1024):.1f} MB"
 
+def _safe_int(x):
+    try:
+        return int(x)
+    except Exception:
+        return None
 
+# -----------------------------
+# DOWNLOAD (robust)
+# -----------------------------
 def _download_file_with_progress(url: str, progress: dict, cancel_event: threading.Event) -> str:
     """
-    Скачивает в temp. progress:
-      downloaded (bytes), total (bytes|None), done (bool), error (str|None), path (str|None)
+    Скачивает в temp.
+    progress keys:
+      downloaded (bytes), total (bytes|None), done (bool), error (str|None), path (str|None), status (int|None)
     """
-    progress["downloaded"] = 0
-    progress["total"] = None
-    progress["done"] = False
-    progress["error"] = None
-    progress["path"] = None
+    progress.update({
+        "downloaded": 0,
+        "total": None,
+        "done": False,
+        "error": None,
+        "path": None,
+        "status": None,
+    })
 
-    try:
-        with SESSION.get(url, stream=True, timeout=(20, 300)) as r:
-            r.raise_for_status()
-            cl = r.headers.get("content-length")
-            if cl and cl.isdigit():
-                progress["total"] = int(cl)
+    # Ретраи с backoff
+    backoffs = [0, 2, 5, 10]  # 4 попытки
+    last_err = None
 
-            fd, path = tempfile.mkstemp(suffix=".mp4")
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 512):
-                        if cancel_event.is_set():
-                            raise RuntimeError("cancelled")
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        progress["downloaded"] += len(chunk)
+    for attempt, delay in enumerate(backoffs, start=1):
+        if delay:
+            time.sleep(delay)
 
-                progress["path"] = path
-                progress["done"] = True
-                return path
+        if cancel_event.is_set():
+            progress["error"] = "cancelled"
+            progress["done"] = True
+            raise RuntimeError("cancelled")
 
-            except Exception:
+        try:
+            # range-запрос помогает некоторым CDN
+            headers = {"Range": "bytes=0-"}
+            with SESSION.get(url, stream=True, headers=headers, timeout=(30, 900), allow_redirects=True) as r:
+                progress["status"] = r.status_code
+
+                # Частые причины отказа
+                if r.status_code in (401, 403):
+                    raise RuntimeError(f"HTTP {r.status_code} forbidden/unauthorized")
+                if r.status_code == 404:
+                    raise RuntimeError("HTTP 404 not found")
+                if r.status_code == 429:
+                    raise RuntimeError("HTTP 429 rate limited")
+                if 500 <= r.status_code <= 599:
+                    raise RuntimeError(f"HTTP {r.status_code} server error")
+
+                r.raise_for_status()
+
+                cl = r.headers.get("content-length")
+                progress["total"] = _safe_int(cl)
+
+                fd, path = tempfile.mkstemp(suffix=".mp4")
                 try:
-                    os.remove(path)
+                    with os.fdopen(fd, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 512):
+                            if cancel_event.is_set():
+                                raise RuntimeError("cancelled")
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            progress["downloaded"] += len(chunk)
+
+                    progress["path"] = path
+                    progress["done"] = True
+                    return path
+
                 except Exception:
-                    pass
-                raise
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                    raise
 
-    except Exception as e:
-        progress["error"] = str(e)
-        progress["done"] = True
-        raise
+        except Exception as e:
+            last_err = e
+            progress["error"] = f"{type(e).__name__}: {e}"
+            # Печатаем в логи (очень помогает)
+            print(f"[download] attempt {attempt}/{len(backoffs)} failed: {progress['error']}")
+            continue
 
+    progress["done"] = True
+    raise RuntimeError(f"download failed after retries: {last_err}")
 
 async def _progress_updater(msg, label: str, progress: dict):
     last_text = ""
     while not progress.get("done"):
         downloaded = int(progress.get("downloaded") or 0)
         total = progress.get("total")
+        status = progress.get("status")
 
         if total and total > 0:
             pct = min(99, int(downloaded * 100 / total))
-            text = f"⏳ Скачиваю «{label}»… {pct}%  ({_fmt_mb(downloaded)} / {_fmt_mb(total)})"
+            text = f"⏳ Скачиваю «{label}»… {pct}% ({_fmt_mb(downloaded)} / {_fmt_mb(total)})"
         else:
             text = f"⏳ Скачиваю «{label}»… ({_fmt_mb(downloaded)})"
+
+        if status:
+            text += f"  [HTTP {status}]"
 
         if text != last_text:
             try:
@@ -148,7 +230,6 @@ async def _progress_updater(msg, label: str, progress: dict):
 
         await asyncio.sleep(1.2)
 
-
 async def _download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, label: str, filename: str):
     progress_msg = await update.message.reply_text(f"⏳ Скачиваю «{label}»…")
     progress = {}
@@ -157,30 +238,13 @@ async def _download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     path = None
     try:
-        try:
-            path = await asyncio.to_thread(_download_file_with_progress, url, progress, cancel_event)
-        except Exception as e1:
-            if "timed out" in str(e1).lower() or "timeout" in str(e1).lower():
-                try:
-                    await progress_msg.edit_text("⏳ Сеть притормозила… пробую ещё раз.")
-                except Exception:
-                    pass
-
-                progress["done"] = False
-                progress["error"] = None
-                progress["downloaded"] = 0
-                progress["total"] = None
-
-                path = await asyncio.to_thread(_download_file_with_progress, url, progress, cancel_event)
-            else:
-                raise
+        path = await asyncio.to_thread(_download_file_with_progress, url, progress, cancel_event)
 
         try:
             await progress_msg.edit_text("📤 Загружено. Отправляю в Telegram…")
         except Exception:
             pass
 
-        # Надёжнее отправлять как документ с именем файла
         with open(path, "rb") as f:
             await update.message.reply_document(
                 document=f,
@@ -188,10 +252,13 @@ async def _download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 caption=f"Готово ✅ «{label}» отправлено."
             )
 
-    except Exception:
+    except Exception as e:
+        # Не показываем ссылку пользователю
+        print("[send] error:", repr(e))
         await update.message.reply_text(
             "Не получилось скачать видео (сеть/сервер временно тормозит).\n"
-            "Попробуй нажать кнопку ещё раз через 10–20 секунд."
+            "Попробуй ещё раз через 10–20 секунд.\n"
+            "Если повторяется — пришли ссылку заново кнопкой «Новая ссылка»."
         )
 
     finally:
@@ -212,10 +279,11 @@ async def _download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
             except Exception:
                 pass
 
-
+# -----------------------------
+# HANDLERS
+# -----------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text(), reply_markup=panel_keyboard())
-
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -255,11 +323,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _download_and_send(update, context, url, label, filename)
         return
 
+    # Sora link
     if SORA_RE.match(text):
         await update.message.reply_text("Принял ✅ Получаю ссылки…", reply_markup=panel_keyboard())
         try:
             data = fetch_video_info(text)
-            cache_put(user_id, data.get("videoUrlHQ"), data.get("url"))
+            cache_put(user_id, text, data.get("videoUrlHQ"), data.get("url"))
 
             item = cache_get(user_id)
             if not item or (not item.get("hq") and not item.get("alt")):
@@ -279,7 +348,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        except Exception:
+        except Exception as e:
+            print("[api] error:", repr(e))
             await update.message.reply_text(
                 "Не смог получить видео по этой ссылке. Попробуй ещё раз позже.",
                 reply_markup=panel_keyboard()
@@ -291,13 +361,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=panel_keyboard()
     )
 
-
+# -----------------------------
+# MAIN
+# -----------------------------
 def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise SystemExit("Нет переменной BOT_TOKEN")
 
-    # ✅ FIX для Python 3.13/3.14 (Render): создаём event loop вручную
+    # Health port for Render Web Service
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    # FIX for Python 3.13/3.14: create event loop explicitly
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -306,8 +381,14 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     print("BOT STARTED ✅")
-    app.run_polling()
 
+    # Auto-restart polling
+    while True:
+        try:
+            app.run_polling()
+        except Exception as e:
+            print("[polling] crashed, restarting in 5s:", repr(e))
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
