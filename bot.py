@@ -17,24 +17,23 @@ from telegram.ext import (
     filters,
     CommandHandler,
 )
+from telegram.error import Conflict
 
-# -----------------------------
-# CONFIG
-# -----------------------------
+
 API_URL = "https://sorasave.questloops.com/api/video-info"
 SORA_RE = re.compile(r"^https://sora\.chatgpt\.com/p/s_[\w-]+", re.IGNORECASE)
 
-TTL_SEC = 10 * 60
-
-# Кнопки (панель над вводом)
+# Кнопки
 BTN_NO_WM = "⬇️ Без вотермарки"
 BTN_ORIG  = "⬇️ Оригинал"
 BTN_NEW   = "🔁 Новая ссылка"
 BTN_HELP  = "ℹ️ Помощь"
 
-# -----------------------------
-# UI
-# -----------------------------
+# Кэш ссылок на пользователя
+CACHE: dict[int, dict] = {}
+TTL_SEC = 10 * 60
+
+
 def panel_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -44,18 +43,18 @@ def panel_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
+
 def help_text() -> str:
     return (
         "Как пользоваться:\n"
         "1) Пришли ссылку Sora вида: https://sora.chatgpt.com/p/s_...\n"
-        "2) Нажми внизу кнопку: «Без вотермарки» или «Оригинал»\n"
+        "2) Нажми кнопку внизу: «Без вотермарки» или «Оригинал»\n"
         "3) Я скачаю и пришлю файлом\n\n"
-        "Если долго — это из-за CDN/сети. Иногда нужно подождать."
+        "Если долго — это CDN/сеть, иногда нужно чуть подождать."
     )
 
-# -----------------------------
-# REQUESTS SESSION
-# -----------------------------
+
+# Requests session
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0",
@@ -65,11 +64,10 @@ SESSION.headers.update({
     "Connection": "keep-alive",
 })
 
-# user_id -> {"hq": url, "alt": url, "ts": epoch, "sora": original_sora_url}
-CACHE: dict[int, dict] = {}
 
 def cache_put(user_id: int, sora_url: str, hq: Optional[str], alt: Optional[str]):
     CACHE[user_id] = {"sora": sora_url, "hq": hq, "alt": alt, "ts": time.time()}
+
 
 def cache_get(user_id: int) -> Optional[dict]:
     item = CACHE.get(user_id)
@@ -80,8 +78,15 @@ def cache_get(user_id: int) -> Optional[dict]:
         return None
     return item
 
+
+def fetch_video_info(sora_url: str) -> dict:
+    r = SESSION.post(API_URL, json={"url": sora_url}, timeout=40)
+    r.raise_for_status()
+    return r.json()
+
+
 # -----------------------------
-# HEALTH SERVER (Render Web Service requires an open port)
+# Render health server (PORT)
 # -----------------------------
 class _HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -95,8 +100,8 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format, *args):
-        # отключаем шум в логах
         return
+
 
 def start_health_server():
     port = int(os.getenv("PORT", "10000"))
@@ -104,16 +109,13 @@ def start_health_server():
         print(f"[health] listening on :{port}")
         httpd.serve_forever()
 
-# -----------------------------
-# API
-# -----------------------------
-def fetch_video_info(sora_url: str) -> dict:
-    r = SESSION.post(API_URL, json={"url": sora_url}, timeout=40)
-    r.raise_for_status()
-    return r.json()
 
+# -----------------------------
+# Download helpers
+# -----------------------------
 def _fmt_mb(n_bytes: int) -> str:
     return f"{n_bytes / (1024 * 1024):.1f} MB"
+
 
 def _safe_int(x):
     try:
@@ -121,15 +123,8 @@ def _safe_int(x):
     except Exception:
         return None
 
-# -----------------------------
-# DOWNLOAD (robust)
-# -----------------------------
+
 def _download_file_with_progress(url: str, progress: dict, cancel_event: threading.Event) -> str:
-    """
-    Скачивает в temp.
-    progress keys:
-      downloaded (bytes), total (bytes|None), done (bool), error (str|None), path (str|None), status (int|None)
-    """
     progress.update({
         "downloaded": 0,
         "total": None,
@@ -139,7 +134,6 @@ def _download_file_with_progress(url: str, progress: dict, cancel_event: threadi
         "status": None,
     })
 
-    # Ретраи с backoff
     backoffs = [0, 2, 5, 10]  # 4 попытки
     last_err = None
 
@@ -153,12 +147,10 @@ def _download_file_with_progress(url: str, progress: dict, cancel_event: threadi
             raise RuntimeError("cancelled")
 
         try:
-            # range-запрос помогает некоторым CDN
-            headers = {"Range": "bytes=0-"}
+            headers = {"Range": "bytes=0-"}  # помогает некоторым CDN
             with SESSION.get(url, stream=True, headers=headers, timeout=(30, 900), allow_redirects=True) as r:
                 progress["status"] = r.status_code
 
-                # Частые причины отказа
                 if r.status_code in (401, 403):
                     raise RuntimeError(f"HTTP {r.status_code} forbidden/unauthorized")
                 if r.status_code == 404:
@@ -198,12 +190,12 @@ def _download_file_with_progress(url: str, progress: dict, cancel_event: threadi
         except Exception as e:
             last_err = e
             progress["error"] = f"{type(e).__name__}: {e}"
-            # Печатаем в логи (очень помогает)
             print(f"[download] attempt {attempt}/{len(backoffs)} failed: {progress['error']}")
             continue
 
     progress["done"] = True
     raise RuntimeError(f"download failed after retries: {last_err}")
+
 
 async def _progress_updater(msg, label: str, progress: dict):
     last_text = ""
@@ -230,6 +222,7 @@ async def _progress_updater(msg, label: str, progress: dict):
 
         await asyncio.sleep(1.2)
 
+
 async def _download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, label: str, filename: str):
     progress_msg = await update.message.reply_text(f"⏳ Скачиваю «{label}»…")
     progress = {}
@@ -253,37 +246,35 @@ async def _download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
             )
 
     except Exception as e:
-        # Не показываем ссылку пользователю
         print("[send] error:", repr(e))
         await update.message.reply_text(
             "Не получилось скачать видео (сеть/сервер временно тормозит).\n"
             "Попробуй ещё раз через 10–20 секунд.\n"
-            "Если повторяется — пришли ссылку заново кнопкой «Новая ссылка»."
+            "Если повторяется — нажми «Новая ссылка» и пришли ссылку заново."
         )
-
     finally:
         cancel_event.set()
         try:
             await updater_task
         except Exception:
             pass
-
         try:
             await progress_msg.delete()
         except Exception:
             pass
-
         if path:
             try:
                 os.remove(path)
             except Exception:
                 pass
 
+
 # -----------------------------
-# HANDLERS
+# Telegram handlers
 # -----------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text(), reply_markup=panel_keyboard())
+
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -323,7 +314,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _download_and_send(update, context, url, label, filename)
         return
 
-    # Sora link
     if SORA_RE.match(text):
         await update.message.reply_text("Принял ✅ Получаю ссылки…", reply_markup=panel_keyboard())
         try:
@@ -332,10 +322,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             item = cache_get(user_id)
             if not item or (not item.get("hq") and not item.get("alt")):
-                await update.message.reply_text(
-                    "Не нашёл ссылок в ответе API. Попробуй другую ссылку.",
-                    reply_markup=panel_keyboard()
-                )
+                await update.message.reply_text("Не нашёл ссылок в ответе API. Попробуй другую ссылку.",
+                                                reply_markup=panel_keyboard())
                 return
 
             await update.message.reply_text(
@@ -350,10 +338,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             print("[api] error:", repr(e))
-            await update.message.reply_text(
-                "Не смог получить видео по этой ссылке. Попробуй ещё раз позже.",
-                reply_markup=panel_keyboard()
-            )
+            await update.message.reply_text("Не смог получить видео по этой ссылке. Попробуй ещё раз позже.",
+                                            reply_markup=panel_keyboard())
         return
 
     await update.message.reply_text(
@@ -361,18 +347,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=panel_keyboard()
     )
 
-# -----------------------------
-# MAIN
-# -----------------------------
+
 def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise SystemExit("Нет переменной BOT_TOKEN")
 
-    # Health port for Render Web Service
+    # 1) Render Web Service: обязательно открыть порт
     threading.Thread(target=start_health_server, daemon=True).start()
 
-    # FIX for Python 3.13/3.14: create event loop explicitly
+    # 2) FIX для Python 3.13/3.14: задаём event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -382,13 +366,17 @@ def main():
 
     print("BOT STARTED ✅")
 
-    # Auto-restart polling
+    # 3) Умный рестарт polling
     while True:
         try:
             app.run_polling()
+        except Conflict as e:
+            print("[polling] Conflict: another instance is polling. Waiting 60s...", repr(e))
+            time.sleep(60)
         except Exception as e:
-            print("[polling] crashed, restarting in 5s:", repr(e))
-            time.sleep(5)
+            print("[polling] crashed, restarting in 10s:", repr(e))
+            time.sleep(10)
+
 
 if __name__ == "__main__":
     main()
