@@ -24,6 +24,7 @@ BTN_ORIG  = "⬇️ Оригинал"
 BTN_NEW   = "🔁 Новая ссылка"
 BTN_HELP  = "ℹ️ Помощь"
 
+
 def panel_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -33,6 +34,7 @@ def panel_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
+
 def help_text() -> str:
     return (
         "Как пользоваться:\n"
@@ -41,6 +43,7 @@ def help_text() -> str:
         "3) Я скачаю и пришлю файлом\n\n"
         "Если долго — это из-за CDN, иногда надо чуть подождать."
     )
+
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -53,8 +56,10 @@ SESSION.headers.update({
 CACHE: dict[int, dict] = {}
 TTL_SEC = 10 * 60
 
+
 def cache_put(user_id: int, hq: str | None, alt: str | None):
     CACHE[user_id] = {"hq": hq, "alt": alt, "ts": time.time()}
+
 
 def cache_get(user_id: int) -> dict | None:
     item = CACHE.get(user_id)
@@ -65,13 +70,16 @@ def cache_get(user_id: int) -> dict | None:
         return None
     return item
 
+
 def fetch_video_info(sora_url: str) -> dict:
     r = SESSION.post(API_URL, json={"url": sora_url}, timeout=40)
     r.raise_for_status()
     return r.json()
 
+
 def _fmt_mb(n_bytes: int) -> str:
     return f"{n_bytes / (1024 * 1024):.1f} MB"
+
 
 def _download_file_with_progress(url: str, progress: dict, cancel_event: threading.Event) -> str:
     """
@@ -118,6 +126,7 @@ def _download_file_with_progress(url: str, progress: dict, cancel_event: threadi
         progress["done"] = True
         raise
 
+
 async def _progress_updater(msg, label: str, progress: dict):
     last_text = ""
     while not progress.get("done"):
@@ -138,6 +147,7 @@ async def _progress_updater(msg, label: str, progress: dict):
                 pass
 
         await asyncio.sleep(1.2)
+
 
 async def _download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, label: str, filename: str):
     progress_msg = await update.message.reply_text(f"⏳ Скачиваю «{label}»…")
@@ -172,7 +182,11 @@ async def _download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         # Надёжнее отправлять как документ с именем файла
         with open(path, "rb") as f:
-            await update.message.reply_document(document=f, filename=filename, caption=f"Готово ✅ «{label}» отправлено.")
+            await update.message.reply_document(
+                document=f,
+                filename=filename,
+                caption=f"Готово ✅ «{label}» отправлено."
+            )
 
     except Exception:
         await update.message.reply_text(
@@ -198,8 +212,10 @@ async def _download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
             except Exception:
                 pass
 
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text(), reply_markup=panel_keyboard())
+
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -230,8 +246,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename = "sora_original.mp4"
 
         if not url:
-            await update.message.reply_text("Для этого варианта ссылка не найдена. Пришли Sora-ссылку заново.",
-                                            reply_markup=panel_keyboard())
+            await update.message.reply_text(
+                "Для этого варианта ссылка не найдена. Пришли Sora-ссылку заново.",
+                reply_markup=panel_keyboard()
+            )
             return
 
         await _download_and_send(update, context, url, label, filename)
@@ -245,8 +263,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             item = cache_get(user_id)
             if not item or (not item.get("hq") and not item.get("alt")):
-                await update.message.reply_text("Не нашёл ссылок в ответе API. Попробуй другую ссылку.",
-                                                reply_markup=panel_keyboard())
+                await update.message.reply_text(
+                    "Не нашёл ссылок в ответе API. Попробуй другую ссылку.",
+                    reply_markup=panel_keyboard()
+                )
                 return
 
             await update.message.reply_text(
@@ -260,8 +280,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
         except Exception:
-            await update.message.reply_text("Не смог получить видео по этой ссылке. Попробуй ещё раз позже.",
-                                            reply_markup=panel_keyboard())
+            await update.message.reply_text(
+                "Не смог получить видео по этой ссылке. Попробуй ещё раз позже.",
+                reply_markup=panel_keyboard()
+            )
         return
 
     await update.message.reply_text(
@@ -269,15 +291,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=panel_keyboard()
     )
 
+
 def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise SystemExit("Нет переменной BOT_TOKEN")
 
+    # ✅ FIX для Python 3.13/3.14 (Render): создаём event loop вручную
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.run_polling(close_loop=False)
+
+    print("BOT STARTED ✅")
+    app.run_polling()
+
 
 if __name__ == "__main__":
     main()
